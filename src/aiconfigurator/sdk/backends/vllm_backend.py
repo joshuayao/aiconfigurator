@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -415,6 +416,7 @@ class VLLMBackend(BaseBackend):
         max_batch_size = kwargs.get("max_batch_size", 512)
         ctx_stride = kwargs.get("ctx_stride", 512)
         enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
+        full_results_csv_path = kwargs.get("full_results_csv_path", "agg_complete_results.csv")
 
         # when b is larger than 1024, the result is not good as the data collection is not enough
         # to cover this.
@@ -441,6 +443,7 @@ class VLLMBackend(BaseBackend):
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
         results_dict_list = []
+        all_results_dict_list = []
         capped_b = []
         all_oom = True
         for b in b_list:
@@ -479,8 +482,24 @@ class VLLMBackend(BaseBackend):
                     break  # larger ctx tokens will cause oom
                 all_oom = False
                 result_dict = summary.get_result_dict()
+                if result_dict:
+                    all_results_dict_list.append(result_dict.copy())
                 if result_dict and result_dict["tpot"] <= tpot and result_dict["ttft"] <= ttft:
                     results_dict_list.append(result_dict)
+
+        all_results_df = pd.DataFrame(columns=common.ColumnsAgg)
+        best_seq_per_bs_df = pd.DataFrame(columns=common.ColumnsAgg)
+        if all_results_dict_list:
+            all_results_df = pd.DataFrame(all_results_dict_list, columns=common.ColumnsAgg).round(3)
+            best_seq_per_bs_df = (
+                all_results_df.sort_values(by=["bs", "seq/s"], ascending=[True, False])
+                .drop_duplicates(subset=["bs"], keep="first")
+                .sort_values(by="bs")
+                .reset_index(drop=True)
+            )
+        if os.path.exists(full_results_csv_path):
+            os.remove(full_results_csv_path)
+        best_seq_per_bs_df.to_csv(full_results_csv_path, index=False)
 
         if results_dict_list:
             results_df = pd.DataFrame(results_dict_list, columns=common.ColumnsAgg).round(3)

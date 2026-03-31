@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# define your experiments here, the order will determine the execution order.
+exps:
+  - exp_agg
+  - exp_disagg
+
+exp_agg:
+  mode: "patch"
+  serving_mode: "agg" # required
+  model_path: "Qwen/Qwen3-8B" # required, HuggingFace model ID
+  total_gpus: 2 # required
+  system_name: "b60" # required, for prefill
+  backend_name: "vllm"
+  profiles: []
+  isl: 1500 # input sequence length
+  osl: 150 # output sequence length
+  ttft: 6000.0  # Target TTFT in ms
+  tpot: 1000.0   # Target TPOT in ms
+  config: # all optional, used to patch default values
+    enable_chunked_prefill: True
+    worker_config: # override quantization of each component
+      gemm_quant_mode: "fp8" # fp8, fp8_static, fp8_block, float16
+      moe_quant_mode: "float16" # fp8, fp8_block, w4afp8, float16
+      kvcache_quant_mode: "fp8" # fp8, int8, float16
+      fmha_quant_mode: "float16" # fp8, float16
+      comm_quant_mode: "half" # half
+
+exp_disagg:
+  mode: "patch"
+  serving_mode: "disagg" # required
+  model_path: "Qwen/Qwen3-8B" # required, HuggingFace model ID
+  total_gpus: 2 # required
+  system_name: "b60" # required, for prefill
+  decode_system_name: "b60" # optional, if not provided, it will use the same system name as the prefill system.
+  backend_name: "vllm"
+  profiles: []
+  isl: 1500 # input sequence length
+  osl: 150 # output sequence length
+  ttft: 6000.0  # Target TTFT in ms
+  tpot: 1000.0   # Target TPOT in ms
+  config: # all optional, used to patch default values
+    enable_chunked_prefill: True
+    worker_config: # override quantization of each component
+      gemm_quant_mode: "fp8" # fp8, fp8_static, fp8_block, float16
+      moe_quant_mode: "float16" # fp8, fp8_block, w4afp8, float16
+      kvcache_quant_mode: "fp8" # fp8, int8, float16
+      fmha_quant_mode: "float16" # fp8, float16
+      comm_quant_mode: "half" # half
