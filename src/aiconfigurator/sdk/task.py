@@ -339,8 +339,8 @@ class TaskConfigFactory:
 
     @staticmethod
     def _base_common_layer(ctx: TaskContext) -> dict:
-        # DeepSeek models natively support MTP with nextn=1; other models default to 0
-        nextn = 1 if ctx.model_family == "DEEPSEEK" else 0
+        # DeepSeek and Qwen3.5 models natively support MTP with nextn=1; other models default to 0
+        nextn = 1 if ctx.model_family in {"DEEPSEEK", "DEEPSEEKV32", "QWEN35"} else 0
         return {
             "serving_mode": ctx.serving_mode,
             "model_path": ctx.model_path,
@@ -493,6 +493,8 @@ class TaskConfigFactory:
             "decode_latency_correction_scale": DEFAULT_DECODE_LATENCY_CORRECTION_SCALE,
             "prefill_max_batch_size": 1,
             "decode_max_batch_size": 512,
+            "rate_matching_prefill_degradation_factor": None,
+            "rate_matching_decode_degradation_factor": None,
         }
 
         return {
@@ -771,7 +773,9 @@ class TaskConfig:
 
         # TODO: add more support matrix based validation
         if self.backend_name == "vllm" and get_model_family(self.model_path) == "DEEPSEEK":
-            raise NotImplementedError("AIConfigurator does not yet support DEEPSEEK models for VLLM backend.")
+            raise NotImplementedError(
+                "AIConfigurator does not yet support DeepSeek-V3/V3.1 family models for the VLLM backend."
+            )
 
         # fp8_static GEMM mode is currently TRTLLM-only.
         def _validate_fp8_static(worker_cfg: DefaultMunch, target: str) -> None:
@@ -861,12 +865,17 @@ class TaskConfig:
             for k, v in quant_modes.items():
                 worker_cfg[k] = v
 
-        is_deepseek = get_model_family(self.model_path) == "DEEPSEEK"
+        model_family = get_model_family(self.model_path)
+        is_deepseek = model_family == "DEEPSEEK"
+        is_deepseek_v32 = model_family == "DEEPSEEKV32"
         enable_wideep = bool(getattr(self.config, "enable_wideep", self.enable_wideep))
         moe_backend = getattr(self.config, "moe_backend", None)
 
         # DeepSeek uses MLA perf tables; others use attention perf tables.
-        if is_deepseek:
+        if is_deepseek_v32:
+            context_attn_key = "dsa_context_module"
+            generation_attn_key = "dsa_generation_module"
+        elif is_deepseek:
             if self.backend_name == "sglang" and enable_wideep:
                 context_attn_key = "wideep_context_mla"
                 generation_attn_key = "wideep_generation_mla"
@@ -1350,6 +1359,12 @@ class TaskRunner:
             decode_max_num_tokens=task_config.advanced_tuning_config.decode_max_batch_size,
             prefill_latency_correction_scale=task_config.advanced_tuning_config.prefill_latency_correction_scale,
             decode_latency_correction_scale=task_config.advanced_tuning_config.decode_latency_correction_scale,
+            rate_matching_prefill_degradation_factor=getattr(
+                task_config.advanced_tuning_config, "rate_matching_prefill_degradation_factor", None
+            ),
+            rate_matching_decode_degradation_factor=getattr(
+                task_config.advanced_tuning_config, "rate_matching_decode_degradation_factor", None
+            ),
             require_same_tp=require_same_tp,
             autoscale=autoscale,
             target_tpot=task_config.runtime_config.tpot if autoscale else None,
