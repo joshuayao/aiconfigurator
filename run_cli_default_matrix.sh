@@ -25,19 +25,6 @@ mkdir -p "$RAW_LOG_DIR"
 
 export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
-MODELS=(
-  "Qwen/Qwen3-8B"
-  "/home/yaoyi/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-)
-
-TOTAL_GPUS=(2 4)
-
-SCENARIOS=(
-  "1500 150 500 50"
-  "2000 256 1500 50"
-  "4500 1000 2000 50"
-)
-
 "$PYTHON_CMD" - "$ROOT_DIR" "$OUTPUT_CSV" "$RAW_LOG_DIR" <<'PY'
 import csv
 import re
@@ -59,6 +46,7 @@ scenarios = [
   (1500, 150, 500, 50),
   (2000, 256, 1500, 50),
   (4500, 1000, 2000, 50),
+  (8192, 1024, 6000, 30),
 ]
 
 headers = [

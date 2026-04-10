@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #  PYTHON_BIN=/home/yaoyi/coding/dev/aic/collect_data/aiconfigurator/myenv/bin/python bash run_cli_default_matrix_agg_in_container.sh cli_default_matrix_results.csv --container vllm-xpu-0_17_0
+#  PYTHON_BIN=/home/yaoyi/coding/dev/aic/collect_data/aiconfigurator/myenv/bin/python bash run_cli_default_matrix_agg_in_container.sh cli_default_matrix_results.csv --container vllm-xpu-0_17_0 --max-num-batched-tokens-mode auto
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
