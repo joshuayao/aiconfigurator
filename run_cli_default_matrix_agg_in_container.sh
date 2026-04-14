@@ -929,7 +929,10 @@ for row in prediction_rows:
     all_rows.append(output_row)
     continue
 
-  max_num_batched_tokens = isl if max_num_batched_tokens_mode == "auto" else max_num_batched_tokens_value
+  if max_num_batched_tokens_mode == "auto":
+    max_num_batched_tokens = normalize_int(row.get("ctx_tokens", "") or "") or isl
+  else:
+    max_num_batched_tokens = max_num_batched_tokens_value
   output_row["max_num_batched_tokens"] = str(max_num_batched_tokens)
   derivation_key = build_derivation_key(row, max_num_batched_tokens)
   scenario_key = build_scenario_key(row, max_num_batched_tokens)

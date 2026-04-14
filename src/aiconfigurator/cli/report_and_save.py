@@ -210,6 +210,7 @@ def _plot_worker_setup_table(
             "gpus/worker",
             "parallel",
             "bs",
+            "ctx_tokens",
         ]
         if show_power:
             field_names.append("power_w")
@@ -249,6 +250,7 @@ def _plot_worker_setup_table(
                     gpus_worker,
                     parallel,
                     row["bs"],
+                    row.get("ctx_tokens", ""),
                 ]
             )
             if show_power:
