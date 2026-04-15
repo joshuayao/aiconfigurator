@@ -457,6 +457,7 @@ ColumnsAgg = [
     "num_gen_reqs",
     "num_tokens",
     "ctx_tokens",
+    "correction_factor",
     "gen_tokens",  # agg specific
     "backend",
     "version",

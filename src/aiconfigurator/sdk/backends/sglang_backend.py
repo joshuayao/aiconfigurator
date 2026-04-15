@@ -360,6 +360,7 @@ class SGLANGBackend(BaseBackend):
                 "num_gen_reqs": num_gen_requests,
                 "num_tokens": num_tokens,
                 "ctx_tokens": ctx_tokens,
+                "correction_factor": correction_factor,
                 "gen_tokens": num_gen_requests,
                 "backend": database.backend,
                 "version": database.version,

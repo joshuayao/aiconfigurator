@@ -211,6 +211,7 @@ def _plot_worker_setup_table(
             "parallel",
             "bs",
             "ctx_tokens",
+            "correction_factor",
         ]
         if show_power:
             field_names.append("power_w")
@@ -251,6 +252,7 @@ def _plot_worker_setup_table(
                     parallel,
                     row["bs"],
                     row.get("ctx_tokens", ""),
+                    row.get("correction_factor", ""),
                 ]
             )
             if show_power:
