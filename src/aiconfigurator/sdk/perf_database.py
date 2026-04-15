@@ -3028,7 +3028,14 @@ class PerfDatabase:
             # y_direction
             for y in target_y_list:
                 if y not in data_dict[x]:
-                    y_left, y_right = self._nearest_1d_point_helper(y, list(data_dict[x].keys()), False)
+                    y_keys = list(data_dict[x].keys())
+                    if len(y_keys) < 2:
+                        logger.warning(
+                            f"Skipping y-direction interpolation for x={x}: "
+                            f"only {len(y_keys)} y-value(s), need at least 2"
+                        )
+                        break
+                    y_left, y_right = self._nearest_1d_point_helper(y, y_keys, False)
                     # Check if both left and right boundaries exist
                     if y_left not in data_dict[x] or y_right not in data_dict[x]:
                         logger.warning(
@@ -3081,9 +3088,15 @@ class PerfDatabase:
                         else:
                             data_dict[x][y][z] = value
 
+        x_keys = list(data_dict.keys())
         for x in target_x_list:
             if x not in data_dict:
-                x_left, x_right = self._nearest_1d_point_helper(x, list(data_dict.keys()), False)
+                if len(x_keys) < 2:
+                    logger.warning(
+                        f"Skipping x-direction interpolation: only {len(x_keys)} x-value(s), need at least 2"
+                    )
+                    break
+                x_left, x_right = self._nearest_1d_point_helper(x, x_keys, False)
                 # Check if both left and right boundaries exist
                 if x_left not in data_dict or x_right not in data_dict:
                     logger.warning(
@@ -3125,7 +3138,12 @@ class PerfDatabase:
         """
         Find the nearest 1d point
         """
-        assert values is not None and len(values) >= 2, "values is None or len(values) < 2"
+        assert values is not None and len(values) >= 1, "values is None or empty"
+        if len(values) == 1:
+            if inner_only and x != values[0]:
+                raise ValueError(f"x is not equal to the only value in the list. {x=}, {values=}")
+            return values[0], values[0]
+
         sorted_values = sorted(values)
 
         if x < sorted_values[0]:
@@ -3585,6 +3603,12 @@ class PerfDatabase:
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
+                def _to_performance_result(result):
+                    """Normalize GEMM table entries into a PerformanceResult."""
+                    if isinstance(result, dict):
+                        return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
+                    return PerformanceResult(result, energy=0.0)
+
                 self._gemm_data.raise_if_not_loaded()
                 if table_quant_mode not in self._gemm_data:
                     supported = sorted([k.name for k in self._gemm_data])
@@ -3594,9 +3618,21 @@ class PerfDatabase:
                         f"quant_mode='{quant_mode.name}'. "
                         f"Supported gemm modes: {supported}"
                     )
-                result = self._interp_3d(m, n, k, self._gemm_data[table_quant_mode], "cubic")
-                # Result is dict: {"latency": ..., "power": ..., "energy": ...}
-                return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
+
+                gemm_data = self._gemm_data[table_quant_mode]
+
+                if m in gemm_data and n in gemm_data[m] and k in gemm_data[m][n]:
+                    result = gemm_data[m][n][k]
+                    return _to_performance_result(result)
+
+                m_values = sorted(m_key for m_key in gemm_data if n in gemm_data[m_key] and k in gemm_data[m_key][n])
+                if len(m_values) >= 2:
+                    m_left, m_right = self._nearest_1d_point_helper(m, m_values, inner_only=False)
+                    result = self._interp_1d([m_left, m_right], [gemm_data[m_left][n][k], gemm_data[m_right][n][k]], m)
+                    return _to_performance_result(result)
+
+                result = self._interp_3d(m, n, k, gemm_data, "cubic")
+                return _to_performance_result(result)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,

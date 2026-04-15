@@ -140,6 +140,8 @@ def cli_default(
     tpot: float = 30.0,
     request_latency: float | None = None,
     prefix: int = 0,
+    free_gpu_memory_fraction: float | None = None,
+    max_seq_len: int | None = None,
     top_n: int = 5,
     save_dir: str | None = None,
     generator_set: list[str] | None = None,
@@ -169,6 +171,11 @@ def cli_default(
         request_latency: Optional end-to-end request latency target (ms).
             Enables request-latency optimization mode.
         prefix: Prefix cache length. Default is 0.
+        free_gpu_memory_fraction: Fraction of free GPU memory allocated for KV cache
+            (default ``None``, meaning the backend default is used). Must be > 0 and <= 1.
+            Used to filter batch sizes that would exceed KV cache capacity.
+        max_seq_len: TRT-LLM ``--max_seq_len`` setting. Controls how many KV blocks are
+            pre-allocated per sequence. Defaults to ``isl + osl`` when ``None``.
         top_n: Number of top configurations to return for each mode (agg/disagg). Default is 5.
         save_dir: Directory to save results. If None, results are not saved to disk.
         generator_set: List of inline generator overrides in KEY=VALUE format (e.g.,
@@ -227,6 +234,8 @@ def cli_default(
         tpot=tpot,
         request_latency=request_latency,
         prefix=prefix,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        max_seq_len=max_seq_len,
     )
 
     result = _execute_and_wrap_result(task_configs, mode="default", top_n=top_n)
@@ -429,6 +438,9 @@ class EstimateResult:
     per_ops_data: dict | None = None
     """Per-operation latency breakdown (populated when available)."""
 
+    kv_cache_warning: str | None = None
+    """Warning message when batch_size exceeds KV cache capacity."""
+
     @property
     def request_latency(self) -> float:
         """End-to-end request latency (ms)."""
@@ -605,6 +617,8 @@ def cli_estimate(
     decode_batch_size: int | None = None,
     decode_num_workers: int | None = None,
     systems_paths: str | None = None,
+    free_gpu_memory_fraction: float | None = None,
+    max_seq_len: int | None = None,
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -654,6 +668,12 @@ def cli_estimate(
         decode_batch_size: Decode batch size (disagg). Required when mode='disagg'.
         decode_num_workers: Number of decode workers (disagg). Required when mode='disagg'.
         systems_paths: Comma-separated systems search paths. Use 'default' for built-in.
+        free_gpu_memory_fraction: Fraction of free GPU memory TRT-LLM allocates for
+            KV cache (default 0.9 for TRTLLM, 1.0 for other backends). Used to check whether the requested batch_size
+            exceeds KV cache capacity.
+        max_seq_len: The TRT-LLM ``--max_seq_len`` setting used at serving time.
+            Controls how many KV blocks TRT-LLM pre-allocates per sequence. Defaults
+            to ``isl + osl`` when ``None``.
 
     Returns:
         EstimateResult with ttft, tpot, power_w, mode, and the full raw result dict.
@@ -726,6 +746,8 @@ def cli_estimate(
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
+            max_seq_len=max_seq_len,
         )
     elif mode == "disagg":
         # Validate required disagg params
@@ -803,6 +825,8 @@ def _run_agg_estimate(
     load_database,
     get_backend,
     get_model,
+    free_gpu_memory_fraction=None,
+    max_seq_len=None,
 ) -> EstimateResult:
     """Run aggregated (IFB) estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -830,7 +854,12 @@ def _run_agg_estimate(
     database = load_database(system_name)
     backend = get_backend(backend_name)
     session = InferenceSession(model, database, backend)
-    summary = session.run_agg(runtime_config, ctx_tokens=ctx_tokens)
+    summary = session.run_agg(
+        runtime_config,
+        ctx_tokens=ctx_tokens,
+        max_seq_len=max_seq_len if max_seq_len is not None else isl + osl,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+    )
 
     if summary.check_oom():
         raise RuntimeError(
@@ -843,6 +872,15 @@ def _run_agg_estimate(
     result_dict = summary.get_result_dict()
     if result_dict is None:
         raise RuntimeError("Estimation produced no results. The configuration may be invalid.")
+
+    kv_warning = None
+    if summary.check_kv_cache_oom():
+        frac_str = str(free_gpu_memory_fraction) if free_gpu_memory_fraction is not None else "backend default"
+        kv_warning = (
+            f"Requested batch_size ({batch_size}) exceeds estimated KV cache capacity "
+            f"(free_gpu_memory_fraction={frac_str}). "
+            "The serving runtime will queue excess requests, causing significantly higher TTFT and inaccurate TPOT."
+        )
 
     return EstimateResult(
         ttft=result_dict["ttft"],
@@ -861,6 +899,7 @@ def _run_agg_estimate(
         raw=result_dict,
         mode="agg",
         per_ops_data=summary.get_per_ops_data(),
+        kv_cache_warning=kv_warning,
     )
 
 

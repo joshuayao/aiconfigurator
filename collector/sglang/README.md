@@ -14,7 +14,7 @@ The collected performance data can be used for performance modeling, scheduling 
 
 ## Overview
 
-- **collect_wideep_attn.py**: Collects performance data for DeepSeek Attention (MLA) operators
+- **collect_mla_module.py**: Collects performance data for MLA and DSA attention module operators
 - **collect_wideep_deepep_moe.py**: Collects performance data for DeepSeek MoE operators
 - **collect_wideep_mlp.py**: Collects performance data for Shared Expert (MLP) operators
 
@@ -38,8 +38,8 @@ Run scripts directly with command-line arguments for single GPU collection:
 # MLP
 python collect_wideep_mlp.py --device cuda:0 --output-path /path/to/output/
 
-# Attention (MLA)
-python collect_wideep_attn.py --device cuda:0 --output-path /path/to/output/
+# Attention (MLA/DSA Module)
+python collect_mla_module.py --mode context --attn-type mla
 
 # MoE
 python collect_wideep_deepep_moe.py --device cuda:0 --output-path /path/to/output/
@@ -62,33 +62,33 @@ python collect.py --backend sglang
 # Run wideep collectors only
 python collect.py --backend sglang --ops wideep_mlp_context wideep_mlp_generation
 
-# Run all wideep operators
-python collect.py --backend sglang --ops wideep_mlp_context wideep_mlp_generation \
-    wideep_mla_context wideep_mla_generation wideep_moe
+# Run MLA/DSA module operators
+python collect.py --backend sglang --ops wideep_mla_context wideep_mla_generation \
+    dsa_context_module dsa_generation_module
 
-# Mixed: non-wideep + wideep (all run in parallel across GPUs)
-python collect.py --backend sglang --ops mla_bmm_gen_pre wideep_mlp_context
+# Mixed: kernel-level + module-level (all run in parallel across GPUs)
+python collect.py --backend sglang --ops mla_bmm_gen_pre dsa_context_module
 ```
 
 **All available operators (when no `--ops` specified):**
 
 | Category | Operator | Description |
 |----------|----------|-------------|
-| Non-wideep | `gemm` | GEMM matrix multiplication |
-| Non-wideep | `mla_context` | MLA prefill phase |
-| Non-wideep | `mla_generation` | MLA decode phase |
-| Non-wideep | `mla_bmm_gen_pre` | MLA BMM gen pre |
-| Non-wideep | `mla_bmm_gen_post` | MLA BMM gen post |
-| Non-wideep | `moe` | MOE operator |
-| Non-wideep | `attention_context` | Standard Attention prefill |
-| Non-wideep | `attention_generation` | Standard Attention decode |
-| Wideep | `wideep_mla_context` | Wideep MLA prefill |
-| Wideep | `wideep_mla_generation` | Wideep MLA decode |
-| Wideep | `wideep_mlp_context` | Wideep MLP prefill |
-| Wideep | `wideep_mlp_generation` | Wideep MLP decode |
+| Kernel | `gemm` | GEMM matrix multiplication |
+| Kernel | `mla_context` | MLA prefill phase |
+| Kernel | `mla_generation` | MLA decode phase |
+| Kernel | `mla_bmm_gen_pre` | MLA BMM gen pre |
+| Kernel | `mla_bmm_gen_post` | MLA BMM gen post |
+| Kernel | `moe` | MOE operator |
+| Kernel | `attention_context` | Standard Attention prefill |
+| Kernel | `attention_generation` | Standard Attention decode |
+| Module | `wideep_mla_context` | MLA module prefill (DeepSeek-V3) |
+| Module | `wideep_mla_generation` | MLA module decode (DeepSeek-V3) |
+| Module | `dsa_context_module` | DSA module prefill (DeepSeek-V3.2, GLM-5) |
+| Module | `dsa_generation_module` | DSA module decode (DeepSeek-V3.2, GLM-5) |
 | Wideep | `wideep_moe` | Wideep MOE |
 
-**Note:** Both non-wideep and wideep operators run in parallel across multiple GPUs. Wideep operators use subprocess-based GPU isolation (via `CUDA_VISIBLE_DEVICES`) to prevent NCCL/distributed initialization conflicts while maintaining parallel execution.
+**Note:** All operators run in parallel across multiple GPUs. Module-level operators use subprocess-based GPU isolation (via `CUDA_VISIBLE_DEVICES`) to prevent NCCL/distributed initialization conflicts.
 
 ## General Configuration
 
@@ -98,10 +98,11 @@ output_path = "/aiconfigurator/src/aiconfigurator/systems/data/h100_sxm/sglang/0
 ```
 
 
-## 1. Attention Operator Collection (collect_wideep_attn.py)
+## 1. Attention Module Collection (collect_mla_module.py)
 
 ### Features
-- Tests different attention backends (flashinfer, fa3)
+- Unified MLA (DeepSeek-V3) and DSA (DeepSeek-V3.2, GLM-5) benchmarking
+- SM-gated precision sweep (bfloat16 + fp8 on Hopper+)
 - Tests various batch sizes, sequence lengths, and head numbers
 - Supports both prefill and decode phases
 - Optional dummy weights mode for fast testing
@@ -110,13 +111,18 @@ output_path = "/aiconfigurator/src/aiconfigurator/systems/data/h100_sxm/sglang/0
 
 #### Direct Mode
 ```bash
-export DEEPSEEK_MODEL_PATH=/path/to/deepseek-v3
-python collect_wideep_attn.py --device cuda:0 --output-path /path/to/output/
+# MLA context phase
+SGLANG_LOAD_FORMAT=dummy SGLANG_TEST_NUM_LAYERS=2 \
+    python collect_mla_module.py --mode context --attn-type mla
+
+# DSA generation phase
+SGLANG_LOAD_FORMAT=dummy SGLANG_TEST_NUM_LAYERS=2 \
+    python collect_mla_module.py --mode generation --attn-type dsa
 ```
 
 #### Framework Mode
 ```bash
-python collect.py --backend sglang --ops wideep_mla_context wideep_mla_generation
+python collect.py --backend sglang --ops wideep_mla_context wideep_mla_generation dsa_context_module dsa_generation_module
 ```
 
 #### Environment Variables
@@ -134,12 +140,12 @@ The script automatically tests the following configuration combinations:
 
 ### Output
 Results are saved to:
-- `wideep_context_mla_perf.txt`: Prefill phase performance data
-- `wideep_generation_mla_perf.txt`: Decode phase performance data
+- `wideep_context_mla_perf.txt` / `dsa_context_module_perf.txt`: Prefill phase performance data
+- `wideep_generation_mla_perf.txt` / `dsa_generation_module_perf.txt`: Decode phase performance data
 
 Output format:
-```
-framework,version,device,op_name,kernel_source,mla_dtype,kv_cache_dtype,num_heads,batch_size,isl,tp_size,step,latency
+```csv
+framework,version,device,op_name,kernel_source,model,architecture,mla_dtype,kv_cache_dtype,gemm_type,num_heads,batch_size,isl,tp_size,step,latency
 ```
 
 ## 2. MoE Operator Collection (collect_wideep_deepep_moe.py)

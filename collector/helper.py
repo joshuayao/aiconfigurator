@@ -1319,6 +1319,36 @@ def power_law_logits_v3(
         return router_logits
 
 
+def build_rank0_local_workload(rank0_info: dict) -> dict[str, object]:
+    """Convert global rank0 routing info into local-rank MoE inputs.
+
+    Keeps the original global top-k probabilities and masks out remote experts
+    so the returned tensors describe only the work executed by rank 0.
+    """
+    import torch
+
+    rank0_selected_slots = rank0_info["rank0_selected_slots"].to(torch.int64)
+    rank0_logits = rank0_info["rank0_logits"].to(torch.float32)
+    slots_per_rank = int(rank0_info["slots_per_rank"])
+
+    topk_weights = torch.gather(rank0_logits, 1, rank0_selected_slots.long()).to(torch.float32)
+
+    local_mask = rank0_selected_slots < slots_per_rank
+    topk_ids = rank0_selected_slots.to(torch.int32).clone()
+    topk_ids[~local_mask] = -1
+    topk_weights[~local_mask] = 0.0
+
+    local_ids = topk_ids[topk_ids >= 0]
+    masked_m = torch.bincount(local_ids, minlength=slots_per_rank).to(torch.int32)
+
+    return {
+        "num_tokens": int(rank0_info["rank0_num_tokens"]),
+        "topk_ids": topk_ids.contiguous(),
+        "topk_weights": topk_weights.contiguous(),
+        "masked_m": masked_m.contiguous(),
+    }
+
+
 def power_law_deepep_prefill(num_tokens, num_experts, topk, ep, alpha):
     """Generate power law distribution for DeepEP MoE prefill phase.
 
@@ -1391,6 +1421,58 @@ def _get_deepseek_model_path():
     Otherwise, download only the necessary config files from HuggingFace.
     This allows running the collector without downloading the full model weights.
     """
+    env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
+    if env_path:
+        return env_path
+
+    # Download config files from HuggingFace (no model weights needed)
+    try:
+        from huggingface_hub import hf_hub_download
+
+        repo_id = "deepseek-ai/DeepSeek-V3"
+        config_files = [
+            "config.json",
+            "configuration_deepseek.py",
+            "tokenizer_config.json",
+            "tokenizer.json",
+        ]
+
+        snapshot_dir = None
+        for filename in config_files:
+            try:
+                path = hf_hub_download(repo_id=repo_id, filename=filename)
+                if snapshot_dir is None:
+                    snapshot_dir = os.path.dirname(path)
+            except Exception as e:
+                print(f"Warning: Failed to download {filename}: {e}")
+
+        if snapshot_dir:
+            print(f"Using DeepSeek-V3 config from HuggingFace cache: {snapshot_dir}")
+            return snapshot_dir
+    except ImportError:
+        print("Warning: huggingface_hub not installed, cannot auto-download config")
+    except Exception as e:
+        print(f"Warning: Failed to download DeepSeek-V3 config: {e}")
+
+    # Fallback to default path
+    return "/deepseek-v3"
+
+
+def _get_moe_model_path():
+    """Get MoE model path, supporting multiple MoE models (DeepSeek, Qwen3, etc.).
+
+    Checks environment variables in priority order:
+    1. MOE_MODEL_PATH - generic, for any MoE model
+    2. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
+    Otherwise, download only the necessary config files from HuggingFace.
+    This allows running the collector without downloading the full model weights.
+    """
+    # Try MOE_MODEL_PATH first (generic)
+    env_path = os.environ.get("MOE_MODEL_PATH")
+    if env_path:
+        return env_path
+
+    # Backward compatibility: try DEEPSEEK_MODEL_PATH
     env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
     if env_path:
         return env_path

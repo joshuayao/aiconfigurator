@@ -3,7 +3,6 @@
 
 import argparse
 import copy
-import json
 import logging
 import os
 import sys
@@ -23,16 +22,31 @@ from aiconfigurator.generator.api import (
 )
 from aiconfigurator.logging_utils import setup_logging
 from aiconfigurator.sdk import common, perf_database
+from aiconfigurator.sdk.models import check_is_moe
 from aiconfigurator.sdk.task import TaskConfig, TaskRunner
-from aiconfigurator.sdk.utils import get_model_config_from_model_path
+from aiconfigurator.sdk.utils import ListFlowDumper, get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
 
 
 def _build_common_cli_parser() -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("--save-dir", type=str, default=None, help="Directory to save the results.")
     common_parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
+    common_parser.add_argument(
+        "--no-color",
+        dest="no_color",
+        action="store_true",
+        help="Disable ANSI colors in output.",
+    )
+    # TODO: maybe move --systems-path here?
+    return common_parser
+
+
+def _build_common_cli_experiments_parser() -> argparse.ArgumentParser:
+    # TODO: some arguments might be unused in some modes.
+    # Example: --top-n not used for generate mode.
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument("--save-dir", type=str, default=None, help="Directory to save the results.")
     common_parser.add_argument(
         "--top-n",
         type=int,
@@ -164,6 +178,29 @@ def _add_default_mode_arguments(parser):
         default=False,
         help="Enable chunked prefill for finer-grained context token sweep during optimization. "
         "When off (default), context token stride is aligned to ISL for faster sweeping.",
+    )
+    parser.add_argument(
+        "--free-gpu-memory-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of free GPU memory TRT-LLM allocates for KV cache (default: 1.0). "
+        "Used to filter batch sizes that would exceed KV cache capacity.",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="TRT-LLM --max_seq_len setting (default: isl + osl). "
+        "Controls how many KV blocks TRT-LLM pre-allocates per sequence. "
+        "Set this to match your actual deployment for accurate KV cache capacity filtering.",
+    )
+    parser.add_argument(
+        "--enable-wideep",
+        action="store_true",
+        default=False,
+        help="Enable Wide Expert Parallelism (WideEP) for MoE models. "
+        "When set, MoE models use EP-only parallelism with deepep_moe backend. "
+        "Applies to both DeepSeek and Qwen3-235B on SGLang.",
     )
 
 
@@ -382,6 +419,22 @@ def _add_estimate_mode_arguments(parser):
         default=False,
         help="Print per-operation latency breakdown for mix step and generation-only step.",
     )
+    parser.add_argument(
+        "--free-gpu-memory-fraction",
+        type=float,
+        default=0.9,
+        help="Fraction of free GPU memory available for KV cache (default: 0.9). "
+        "Used to estimate max concurrent sequences and warn when batch_size "
+        "exceeds KV cache capacity.",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="TRT-LLM --max_seq_len setting (default: isl + osl). "
+        "Controls how many KV blocks TRT-LLM pre-allocates per sequence. "
+        "Set this to match your actual deployment to get an accurate KV cache capacity warning.",
+    )
 
 
 def _add_support_mode_arguments(parser):
@@ -443,11 +496,12 @@ aiconfigurator cli default --model Qwen/Qwen3-32B-FP8 \\
 
 def configure_parser(parser):
     common_cli_parser = _build_common_cli_parser()
+    common_cli_experiments_parser = _build_common_cli_experiments_parser()
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     default_parser = subparsers.add_parser(
         "default",
-        parents=[common_cli_parser],
+        parents=[common_cli_parser, common_cli_experiments_parser],
         help="Run the default agg vs disagg comparison.",
         description="Run the default agg vs disagg comparison.",
         epilog=_USAGE_EXAMPLES,
@@ -460,11 +514,11 @@ def configure_parser(parser):
     example_yaml_path = os.path.join(os.path.dirname(__file__), "example.yaml")
     with open(example_yaml_path) as f:
         example_yaml = yaml.safe_load(f)
-    description = help_text + "\n\nExample:\n" + json.dumps(example_yaml, indent=2)
+    description = help_text + "\n\nExample:\n\n" + yaml.dump(example_yaml, indent=2, Dumper=ListFlowDumper)
 
     experiments_parser = subparsers.add_parser(
         "exp",
-        parents=[common_cli_parser],
+        parents=[common_cli_parser, common_cli_experiments_parser],
         help=help_text,
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -474,7 +528,7 @@ def configure_parser(parser):
     # Generate mode - naive config without sweeping
     generate_parser = subparsers.add_parser(
         "generate",
-        parents=[common_cli_parser],
+        parents=[common_cli_parser, common_cli_experiments_parser],
         help="Generate naive agg config without SLA optimization (no sweeping).",
         description=(
             "Generate a working agg configuration without running the parameter sweep. "
@@ -487,7 +541,7 @@ def configure_parser(parser):
     # Estimate mode - single-point performance estimation
     estimate_parser = subparsers.add_parser(
         "estimate",
-        parents=[common_cli_parser],
+        parents=[common_cli_parser, common_cli_experiments_parser],
         help="Estimate TTFT, TPOT, and power for a single model/system/config.",
         description=(
             "Run a single-point performance estimation to predict TTFT (time to first token), "
@@ -500,12 +554,12 @@ def configure_parser(parser):
     # Support mode - support matrix check
     support_parser = subparsers.add_parser(
         "support",
+        parents=[common_cli_parser],
         help="(Optional) Check if AIC supports the model/hardware combo for (agg, disagg).",
         description="Optional pre-flight check to verify support for a specific model and system "
         "combination using the support matrix. You can skip this and run 'cli default' directly. "
         "Use --system all for a consolidated matrix view across all systems and backends.",
     )
-    support_parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
     _add_support_mode_arguments(support_parser)
 
 
@@ -599,6 +653,9 @@ def build_default_task_configs(
     nextn: int = 0,
     nextn_accept_rates: list[float] | None = None,
     enable_chunked_prefill: bool = False,
+    free_gpu_memory_fraction: float | None = None,
+    max_seq_len: int | None = None,
+    enable_wideep: bool = False,
 ) -> dict[str, TaskConfig]:
     """Build agg and disagg task configs for default mode comparison.
 
@@ -620,6 +677,7 @@ def build_default_task_configs(
         nextn: Number of draft tokens for MTP speculative decoding.
         nextn_accept_rates: Acceptance rates for MTP draft tokens.
         enable_chunked_prefill: Whether to enable chunked prefill for finer context token sweep.
+        enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
 
     Returns:
         Dict with TaskConfig objects. When backend='auto', returns 6 configs
@@ -687,7 +745,15 @@ def build_default_task_configs(
         "prefix": prefix,
         "database_mode": database_mode,
         "enable_chunked_prefill": enable_chunked_prefill,
+        "free_gpu_memory_fraction": free_gpu_memory_fraction,
+        "max_seq_len": max_seq_len,
+        "enable_wideep": enable_wideep,
     }
+
+    # Auto-set moe_backend for SGLang wideep, matching webapp behavior
+    # (webapp/events/event_fn.py sets moe_backend="deepep_moe" when enable_wideep + sglang)
+    if enable_wideep:
+        common_kwargs["moe_backend"] = "deepep_moe"
 
     # Create yaml_config to pass nextn and nextn_accept_rates if specified
     yaml_config = None
@@ -700,6 +766,7 @@ def build_default_task_configs(
         }
 
     task_configs: dict[str, TaskConfig] = {}
+    is_moe_model = check_is_moe(model_path)
 
     for backend_name in backends_to_sweep:
         # Create agg task for this backend
@@ -710,6 +777,14 @@ def build_default_task_configs(
         agg_task = TaskConfig(serving_mode="agg", **agg_kwargs)
         exp_name = f"agg_{backend_name}" if backend == "auto" else "agg"
         task_configs[exp_name] = agg_task
+
+        # For SGLang MoE without --enable-wideep, also sweep DeepEP intra-node
+        if backend_name == "sglang" and not enable_wideep and is_moe_model:
+            deepep_kwargs = dict(agg_kwargs)
+            deepep_kwargs["moe_backend"] = "deepep_moe"
+            deepep_task = TaskConfig(serving_mode="agg", **deepep_kwargs)
+            deepep_name = f"agg_{backend_name}_deepep" if backend == "auto" else "agg_deepep"
+            task_configs[deepep_name] = deepep_task
 
         if total_gpus < 2:
             logger.warning("Skipping disagg since it requires at least 2 GPUs.")
@@ -724,6 +799,14 @@ def build_default_task_configs(
         disagg_task = TaskConfig(serving_mode="disagg", **disagg_kwargs)
         exp_name = f"disagg_{backend_name}" if backend == "auto" else "disagg"
         task_configs[exp_name] = disagg_task
+
+        # For SGLang MoE without --enable-wideep, also sweep DeepEP intra-node
+        if backend_name == "sglang" and not enable_wideep and is_moe_model:
+            deepep_disagg_kwargs = dict(disagg_kwargs)
+            deepep_disagg_kwargs["moe_backend"] = "deepep_moe"
+            deepep_disagg_task = TaskConfig(serving_mode="disagg", **deepep_disagg_kwargs)
+            deepep_name = f"disagg_{backend_name}_deepep" if backend == "auto" else "disagg_deepep"
+            task_configs[deepep_name] = deepep_disagg_task
 
     return task_configs
 
@@ -1047,6 +1130,7 @@ def _run_generate_mode(args):
     parallelism = result["parallelism"]
     tp = parallelism["tp"]
     pp = parallelism["pp"]
+    gpus_per_worker = parallelism.get("gpus_per_worker", tp * pp)
     replicas = parallelism["replicas"]
     gpus_used = parallelism["gpus_used"]
 
@@ -1059,7 +1143,7 @@ def _run_generate_mode(args):
     print(f"  Backend:         {args.backend} ({backend_version})")
     print(f"  Total GPUs:      {args.total_gpus} (using {gpus_used})")
     print(f"  Parallelism:     TP={tp}, PP={pp}")
-    print(f"  Replicas:        {replicas} (each using {tp * pp} GPUs)")
+    print(f"  Replicas:        {replicas} (each using {gpus_per_worker} GPUs)")
     print(f"  Max Batch Size:  {generator_params['params']['agg']['max_batch_size']}")
     print(f"  Output:          {output_dir}")
     print("=" * 60)
@@ -1316,6 +1400,8 @@ def _run_estimate_mode(args):
         fmha_quant_mode=args.fmha_quant_mode,
         moe_quant_mode=args.moe_quant_mode,
         comm_quant_mode=args.comm_quant_mode,
+        free_gpu_memory_fraction=args.free_gpu_memory_fraction,
+        max_seq_len=args.max_seq_len,
     )
 
     if estimate_mode == "disagg":
@@ -1385,6 +1471,9 @@ def _run_estimate_mode(args):
         print(f"  (d) Memory:       {raw.get('(d)memory', 'N/A')} GB")
     print("=" * 60)
 
+    if result.kv_cache_warning:
+        logger.warning(result.kv_cache_warning)
+
     if args.print_per_ops_latency and result.per_ops_data:
         _print_per_ops_latency(result.per_ops_data)
 
@@ -1392,7 +1481,10 @@ def _run_estimate_mode(args):
 
 
 def main(args):
-    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
+    setup_logging(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        no_color=getattr(args, "no_color", False),
+    )
 
     # Handle support mode early — it doesn't need systems_paths or top_n
     if args.mode == "support":
@@ -1435,6 +1527,9 @@ def main(args):
             nextn=args.nextn,
             nextn_accept_rates=[float(x) for x in args.nextn_accept_rates.split(",")],
             enable_chunked_prefill=args.enable_chunked_prefill,
+            free_gpu_memory_fraction=args.free_gpu_memory_fraction,
+            max_seq_len=args.max_seq_len,
+            enable_wideep=getattr(args, "enable_wideep", False),
         )
     elif args.mode == "exp":
         try:

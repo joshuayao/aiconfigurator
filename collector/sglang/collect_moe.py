@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_default_config,
     get_moe_configs,
 )
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
 try:
@@ -39,7 +39,14 @@ except ImportError:
 try:
     from common_test_cases import get_common_moe_test_cases
 
-    from helper import balanced_logits, benchmark_with_power, get_sm_version, log_perf, power_law_logits_v3
+    from helper import (
+        balanced_logits,
+        benchmark_with_power,
+        build_rank0_local_workload,
+        get_sm_version,
+        log_perf,
+        power_law_logits_v3,
+    )
 except ModuleNotFoundError:
     import os
     import sys
@@ -47,7 +54,14 @@ except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from common_test_cases import get_common_moe_test_cases
 
-    from helper import balanced_logits, benchmark_with_power, get_sm_version, log_perf, power_law_logits_v3
+    from helper import (
+        balanced_logits,
+        benchmark_with_power,
+        build_rank0_local_workload,
+        get_sm_version,
+        log_perf,
+        power_law_logits_v3,
+    )
 
 
 _is_hip = is_hip()
@@ -68,11 +82,6 @@ def get_moe_test_cases():
 
     for common_moe_testcase in get_common_moe_test_cases():
         if common_moe_testcase.token_expert_distribution != "power_law":
-            continue
-
-        # Skip EP > 1 test cases - this collector only supports single-GPU MOE (ep_size=1)
-        # For EP > 1 (multi-GPU expert parallelism), use collect_wideep_deepep_moe.py instead
-        if common_moe_testcase.ep != 1:
             continue
 
         model_name = common_moe_testcase.model_name
@@ -137,11 +146,17 @@ def benchmark_config(
     num_iters: int = 10,
     distributed: str = "power_law",
     power_law_alpha: float = 0,
+    workloads: list["Rank0Workload"] | None = None,
 ) -> float:
     device = torch.device("cuda")
+    if workloads is not None:
+        num_iters = len(workloads)
+        num_tokens = max(workload["hidden_states"].shape[0] for workload in workloads)
 
     # 1. Gating Output Generation (Common)
-    if distributed == "uniform":
+    if workloads is not None:
+        gating_output = None
+    elif distributed == "uniform":
         gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32, device=device)
     elif distributed == "balanced":
         gating_output = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
@@ -187,7 +202,11 @@ def benchmark_config(
             counts = [(topk_idx.view(-1) == i).sum() for i in range(num_experts)]
             return torch.tensor(counts, dtype=torch.int32, device=device)
 
-        masked_m_list = [get_masked_m(logits) for logits in gating_output]
+        masked_m_list = (
+            [workload["masked_m"] for workload in workloads]
+            if workloads is not None
+            else [get_masked_m(logits) for logits in gating_output]
+        )
 
         # Calculate the maximum tokens any single expert will handle across all iterations
         max_m = 0
@@ -213,7 +232,7 @@ def benchmark_config(
             )
     else:
         init_dtype = torch.float16 if use_fp8_w8a8 else dtype
-        x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+        x = None if workloads is not None else torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
         if use_int8_w8a16 or use_int8_w8a8:
             w1 = torch.randint(
                 -127, 127, (num_experts, shard_intermediate_size, hidden_size), dtype=torch.int8, device=device
@@ -255,23 +274,33 @@ def benchmark_config(
             f8_type = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             w1, w2 = w1.to(f8_type), w2.to(f8_type)
 
-        topk_output = select_experts(x, torch.randn(num_tokens, num_experts, device=device), TopKConfig(top_k=topk))
+        topk_output = (
+            None
+            if workloads is not None
+            else select_experts(x, torch.randn(num_tokens, num_experts, device=device), TopKConfig(top_k=topk))
+        )
 
         def run_op(i):
             from sglang.srt.layers.moe.fused_moe_triton import override_config
 
-            input_gating = gating_output[i % num_iters]
-            new_topk = select_experts(x, input_gating, TopKConfig(top_k=topk))
-            topk_output.topk_weights.copy_(new_topk.topk_weights)
-            topk_output.topk_ids.copy_(new_topk.topk_ids)
-            topk_output.router_logits.copy_(new_topk.router_logits)
+            if workloads is None:
+                input_gating = gating_output[i % num_iters]
+                new_topk = select_experts(x, input_gating, TopKConfig(top_k=topk))
+                topk_output.topk_weights.copy_(new_topk.topk_weights)
+                topk_output.topk_ids.copy_(new_topk.topk_ids)
+                topk_output.router_logits.copy_(new_topk.router_logits)
+                current_hidden_states = x
+                current_topk_output = topk_output
+            else:
+                current_hidden_states = workloads[i % num_iters]["hidden_states"]
+                current_topk_output = workloads[i % num_iters]["topk_output"]
 
             with override_config(config):
                 fused_moe(
-                    x,
+                    current_hidden_states,
                     w1,
                     w2,
-                    topk_output,
+                    current_topk_output,
                     use_fp8_w8a8=use_fp8_w8a8,
                     use_int8_w8a8=use_int8_w8a8,
                     use_int8_w8a16=use_int8_w8a16,
@@ -315,14 +344,18 @@ def benchmark(
     block_shape: list[int] | None = None,
     distributed: str = "power_law",
     power_law_alpha: float = 0,
+    workloads: list["Rank0Workload"] | None = None,
 ) -> tuple[dict[str, int], float]:
     torch.cuda.manual_seed_all(0)
+    benchmark_num_tokens = (
+        max(workload["hidden_states"].shape[0] for workload in workloads) if workloads is not None else num_tokens
+    )
 
     if use_nvfp4:
         # nvfp4 uses flashinfer cutedsl backend, which doesn't need triton configs
         kernel_time, power_stats = benchmark_config(
             None,
-            num_tokens,
+            benchmark_num_tokens,
             num_experts,
             shard_intermediate_size,
             hidden_size,
@@ -335,6 +368,7 @@ def benchmark(
             block_shape,
             distributed=distributed,
             power_law_alpha=power_law_alpha,
+            workloads=workloads,
         )
         return kernel_time, power_stats
 
@@ -350,7 +384,7 @@ def benchmark(
     op_config = get_moe_configs(num_experts, shard_intermediate_size // 2, dtype_str, block_n, block_k)
     if op_config is None:
         config = get_default_config(
-            num_tokens,
+            benchmark_num_tokens,
             num_experts,
             shard_intermediate_size,
             hidden_size,
@@ -360,10 +394,10 @@ def benchmark(
             block_shape,
         )
     else:
-        config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
+        config = op_config[min(op_config.keys(), key=lambda x: abs(x - benchmark_num_tokens))]
     kernel_time, power_stats = benchmark_config(
         config,
-        num_tokens,
+        benchmark_num_tokens,
         num_experts,
         shard_intermediate_size,
         hidden_size,
@@ -376,8 +410,54 @@ def benchmark(
         block_shape,
         distributed=distributed,
         power_law_alpha=power_law_alpha,
+        workloads=workloads,
     )
     return kernel_time, power_stats
+
+
+class Rank0Workload(TypedDict):
+    hidden_states: torch.Tensor
+    topk_output: StandardTopKOutput
+    masked_m: torch.Tensor
+
+
+def build_power_law_rank0_workloads(
+    num_workloads: int,
+    num_tokens: int,
+    hidden_size: int,
+    topk: int,
+    num_experts: int,
+    moe_ep_size: int,
+    power_law_alpha: float,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[Rank0Workload]:
+    workloads: list[Rank0Workload] = []
+
+    for _ in range(num_workloads):
+        _, rank0_info = power_law_logits_v3(
+            num_tokens,
+            num_experts,
+            topk,
+            moe_ep_size,
+            power_law_alpha,
+            return_rank0_info=True,
+        )
+        rank0_local = build_rank0_local_workload(rank0_info)
+        rank0_num_tokens = int(rank0_local["num_tokens"])
+        workloads.append(
+            {
+                "hidden_states": torch.randn(rank0_num_tokens, hidden_size, dtype=dtype, device=device),
+                "topk_output": StandardTopKOutput(
+                    topk_weights=rank0_local["topk_weights"].to(device=device, dtype=torch.float32),
+                    topk_ids=rank0_local["topk_ids"].to(device=device, dtype=torch.int32),
+                    router_logits=torch.empty((rank0_num_tokens, 0), dtype=torch.float32, device=device),
+                ),
+                "masked_m": rank0_local["masked_m"].to(device=device, dtype=torch.int32),
+            }
+        )
+
+    return workloads
 
 
 def run_moe_torch(
@@ -398,29 +478,60 @@ def run_moe_torch(
     torch.cuda.set_device(device)
     torch.set_default_device(device)
 
-    assert moe_ep_size == 1, "only support moe ep size = 1"
     assert moe_type in [
         "fp8_block",
         "float16",
         "nvfp4",
     ], "only support moe type = fp8_block, float16 or nvfp4"
     assert inter_size % moe_tp_size == 0, "inter_size % moe_tp_size must be 0"
+    assert num_experts % moe_ep_size == 0, "num_experts must be divisible by moe_ep_size"
 
-    latency, power_stats = benchmark(
-        num_tokens,
-        num_experts,
-        2 * inter_size // moe_tp_size,
-        hidden_size,
-        topk,
-        torch.bfloat16,
-        moe_type == "fp8_block",
-        False,
-        False,
-        use_nvfp4=moe_type == "nvfp4",
-        block_shape=None,
-        distributed=distributed,
-        power_law_alpha=power_law_alpha,
-    )
+    num_local_experts = num_experts // moe_ep_size
+
+    if moe_ep_size > 1 and distributed == "power_law":
+        rank0_workloads = build_power_law_rank0_workloads(
+            num_workloads=5,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            topk=topk,
+            num_experts=num_experts,
+            moe_ep_size=moe_ep_size,
+            power_law_alpha=power_law_alpha,
+            dtype=torch.bfloat16,
+            device=torch.device(device),
+        )
+        latency, power_stats = benchmark(
+            num_tokens,
+            num_local_experts,
+            2 * inter_size // moe_tp_size,
+            hidden_size,
+            topk,
+            torch.bfloat16,
+            moe_type == "fp8_block",
+            False,
+            False,
+            use_nvfp4=moe_type == "nvfp4",
+            block_shape=None,
+            distributed=distributed,
+            power_law_alpha=power_law_alpha,
+            workloads=rank0_workloads,
+        )
+    else:
+        latency, power_stats = benchmark(
+            num_tokens,
+            num_local_experts,
+            2 * inter_size // moe_tp_size,
+            hidden_size,
+            topk,
+            torch.bfloat16,
+            moe_type == "fp8_block",
+            False,
+            False,
+            use_nvfp4=moe_type == "nvfp4",
+            block_shape=None,
+            distributed=distributed,
+            power_law_alpha=power_law_alpha,
+        )
 
     log_perf(
         item_list=[
