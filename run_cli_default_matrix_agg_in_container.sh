@@ -195,7 +195,7 @@ max_num_batched_tokens_mode = os.environ["MAX_NUM_BATCHED_TOKENS_MODE"].strip().
 max_num_batched_tokens_value = int(os.environ["MAX_NUM_BATCHED_TOKENS_VALUE"])
 host_name = os.environ["HOST_NAME"]
 gpu_memory_utilization = os.environ["GPU_MEMORY_UTILIZATION"]
-max_model_len = os.environ["MAX_MODEL_LEN"]
+base_max_model_len = int(os.environ["MAX_MODEL_LEN"])
 block_size = os.environ["BLOCK_SIZE"]
 aiperf_venv = os.environ["AIPERF_VENV"]
 
@@ -301,6 +301,16 @@ def pct_delta(predicted: float, measured: float) -> float | None:
   if predicted == 0:
     return None
   return (measured - predicted) / predicted * 100.0
+
+
+def choose_max_model_len(base_value: int, isl: int, osl: int) -> int:
+  if base_value <= 0:
+    raise ValueError("MAX_MODEL_LEN must be a positive integer")
+  required = isl + osl
+  if base_value >= required:
+    return base_value
+  multiplier = (required + base_value - 1) // base_value
+  return base_value * multiplier
 
 
 def add_comparison_metrics(output_row: dict[str, str]) -> None:
@@ -529,6 +539,7 @@ def start_vllm(
   served_model_name: str,
   tp: int,
   num_gpus: int,
+  max_model_len_value: int,
   max_num_batched_tokens: int,
   log_path: str,
 ) -> str:
@@ -545,9 +556,9 @@ nohup vllm serve {shlex.quote(model)} \
   --port {port} \
   --seed 42 \
   --enforce-eager \
-  --dtype float16 \
+  --dtype bfloat16 \
   --gpu-memory-utilization {shlex.quote(gpu_memory_utilization)} \
-  --max-model-len {shlex.quote(max_model_len)} \
+  --max-model-len {max_model_len_value} \
   --max_num_batched_tokens {max_num_batched_tokens} \
   --block-size {shlex.quote(block_size)} \
   --no-enable-prefix-caching \
@@ -571,9 +582,9 @@ nohup vllm serve {shlex.quote(model)} \
   --port {port} \
   --seed 42 \
   --enforce-eager \
-  --dtype float16 \
+  --dtype bfloat16 \
   --gpu-memory-utilization {shlex.quote(gpu_memory_utilization)} \
-  --max-model-len {shlex.quote(max_model_len)} \
+  --max-model-len {max_model_len_value} \
   --max_num_batched_tokens {max_num_batched_tokens} \
   --block-size {shlex.quote(block_size)} \
   --no-enable-prefix-caching \
@@ -902,6 +913,7 @@ for row in prediction_rows:
   isl = normalize_int(row.get("ISL", "") or "")
   osl = normalize_int(row.get("OSL", "") or "")
   benchmark_bs = normalize_int(row.get("concurrency", "") or "")
+  predicted_bs = normalize_int(row.get("BS", "") or "")
   parallel = row.get("Parallel", "")
 
   case_label = (
@@ -930,9 +942,16 @@ for row in prediction_rows:
     continue
 
   if max_num_batched_tokens_mode == "auto":
-    max_num_batched_tokens = normalize_int(row.get("ctx_tokens", "") or "") or isl
+    ctx_tokens = normalize_int(row.get("ctx_tokens", "") or "")
+    batch_size = predicted_bs if predicted_bs is not None else benchmark_bs
+    if ctx_tokens is None:
+      ctx_tokens = isl
+    if batch_size is None:
+      batch_size = 0
+    max_num_batched_tokens = ctx_tokens + batch_size
   else:
     max_num_batched_tokens = max_num_batched_tokens_value
+  effective_max_model_len = choose_max_model_len(base_max_model_len, isl, osl)
   output_row["max_num_batched_tokens"] = str(max_num_batched_tokens)
   derivation_key = build_derivation_key(row, max_num_batched_tokens)
   scenario_key = build_scenario_key(row, max_num_batched_tokens)
@@ -946,6 +965,8 @@ for row in prediction_rows:
   log_kv("GPUs", str(num_gpus))
   log_kv("Parallel", parallel)
   log_kv("Benchmark concurrency", str(benchmark_bs))
+  log_kv("max_model_len(base)", str(base_max_model_len))
+  log_kv("max_model_len(effective)", str(effective_max_model_len))
   log_kv("max_num_batched_tokens", str(max_num_batched_tokens))
 
   source_entry = None
@@ -1007,6 +1028,7 @@ for row in prediction_rows:
       served_model_name=request_model_name,
       tp=tp,
       num_gpus=num_gpus,
+      max_model_len_value=effective_max_model_len,
       max_num_batched_tokens=max_num_batched_tokens,
       log_path=vllm_log_in_container,
     )
