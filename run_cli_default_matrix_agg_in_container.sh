@@ -819,17 +819,13 @@ def derive_output_row_from_source(
   output_row["measured_TTFT (ms)"] = source_row["measured_TTFT (ms)"]
   output_row["measured_TPOT (ms)"] = source_row["measured_TPOT (ms)"]
 
-  throughput_keys = [
-    "measured_tokens/s/gpu",
-    "measured_tokens/s/user",
-    "measured_req/s",
-  ]
-  for key in throughput_keys:
-    value = parse_float(source_row.get(key, ""))
-    if value is None:
-      output_row[key] = ""
-      continue
-    output_row[key] = f"{value * scale_factor:.2f}"
+  # tokens/s/gpu and tokens/s/user are per-instance metrics; copy directly.
+  for key in ("measured_tokens/s/gpu", "measured_tokens/s/user"):
+    output_row[key] = source_row.get(key, "")
+
+  # req/s is an aggregate metric; scale with GPU count.
+  req_s = parse_float(source_row.get("measured_req/s", ""))
+  output_row["measured_req/s"] = f"{req_s * scale_factor:.2f}" if req_s is not None else ""
 
   add_comparison_metrics(output_row)
   output_row["status"] = "derived"
